@@ -138,4 +138,13 @@ scheduler = AsyncIOScheduler()
 scheduler.add_job(lambda: send_daily(app), "cron", hour=20, minute=30)
 scheduler.start()
 
-app.run_polling()
+import os
+
+PORT = int(os.environ.get("PORT", 10000))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+
+app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    webhook_url=f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
+)
