@@ -605,7 +605,7 @@ def _build_ydl_opts() -> dict:
     若已配置 YOUTUBE_COOKIES 环境变量，自动加入 cookiefile，
     避免 YouTube 的「Sign in to confirm you're not a bot」错误。
     """
-   opts = {
+    opts = {
         "format":            "bestaudio/best",   # 简化格式，兼容性最好
         "quiet":             False,              # 开启日志方便排查
         "no_warnings":       False,
