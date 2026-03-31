@@ -596,7 +596,7 @@ def _build_ydl_opts() -> dict:
     避免 YouTube 的「Sign in to confirm you're not a bot」错误。
     """
     opts = {
-        "format":      "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+        "format":      "bestaudio/best",
         "quiet":       True,
         "no_warnings": True,
     }
@@ -637,6 +637,7 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             video_title  = info.get("title", "")
             audio_url    = info.get("url", "")
             http_headers = info.get("http_headers", {})
+            ydl_ext      = info.get("ext", "webm")
 
             if not audio_url:
                 raise ValueError("无法从该链接提取音频流，请换一个视频试试")
@@ -647,7 +648,7 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # ③ 转写
             await thinking.edit_text("🎙 正在转写音频内容，请稍候...")
-            transcript = await transcribe_audio_bytes(audio_bytes, ext)
+            transcript = await transcribe_audio_bytes(audio_bytes, ydl_ext)
 
             # ④ AI 分析难度
             await thinking.edit_text("🤖 正在分析难度，请稍候...")
