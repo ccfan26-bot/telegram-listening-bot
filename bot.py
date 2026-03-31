@@ -38,9 +38,19 @@ if not DATABASE_URL:
 # ── 若设置了 YOUTUBE_COOKIES，启动时写入临时文件 ──
 _COOKIES_FILE = "/tmp/yt_cookies.txt"
 if YOUTUBE_COOKIES:
+    # 修复 Render 环境变量中的换行符问题
+    cookie_text = YOUTUBE_COOKIES
+    # 若是字面量 \n（未真正换行），转换为真实换行
+    if "\\n" in cookie_text and "\n" not in cookie_text:
+        cookie_text = cookie_text.replace("\\n", "\n")
+    # 统一换行符为 \n
+    cookie_text = cookie_text.replace("\r\n", "\n").replace("\r", "\n")
     with open(_COOKIES_FILE, "w", encoding="utf-8") as _cf:
-        _cf.write(YOUTUBE_COOKIES)
-    print("✅ YouTube cookies 已写入 /tmp/yt_cookies.txt")
+        _cf.write(cookie_text)
+    # 打印前两行用于验证格式是否正确
+    first_lines = cookie_text.splitlines()[:2]
+    print(f"✅ YouTube cookies 已写入，共 {len(cookie_text)} 字符")
+    print(f"   前两行：{first_lines}")
 else:
     _COOKIES_FILE = None
     print("⚠️  未配置 YOUTUBE_COOKIES，yt-dlp 将以匿名方式访问 YouTube")
@@ -595,13 +605,19 @@ def _build_ydl_opts() -> dict:
     若已配置 YOUTUBE_COOKIES 环境变量，自动加入 cookiefile，
     避免 YouTube 的「Sign in to confirm you're not a bot」错误。
     """
-    opts = {
-        "format":      "bestaudio/bestvideo/best",
-        "quiet":       True,
-        "no_warnings": True,
+   opts = {
+        "format":            "bestaudio/best",   # 简化格式，兼容性最好
+        "quiet":             False,              # 开启日志方便排查
+        "no_warnings":       False,
+        "noplaylist":        True,
+        "socket_timeout":    30,
+        "extractor_retries": 3,
     }
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
+        print(f"[ydl] 使用 cookies 文件：{_COOKIES_FILE}")
+    else:
+        print("[ydl] 未使用 cookies，匿名访问")
     return opts
 
 
