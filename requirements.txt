@@ -2,3 +2,5 @@ python-telegram-bot[webhooks]==20.3
 openai>=1.0.0
 apscheduler
 psycopg2-binary
+pytz
+gtts
