@@ -1,7 +1,8 @@
 import os
 import base64
 import datetime
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,9 +19,13 @@ import openai
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 POE_API_KEY = os.getenv("POE_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN or not POE_API_KEY:
     raise ValueError("Missing BOT_TOKEN or POE_API_KEY")
+
+if not DATABASE_URL:
+    raise ValueError("Missing DATABASE_URL")
 
 # ==============================
 # Poe 客户端
@@ -33,17 +38,17 @@ client = openai.OpenAI(
 # ==============================
 # 数据库
 # ==============================
-conn = sqlite3.connect("/tmp/users.db", check_same_thread=False)
+conn = psycopg2.connect(DATABASE_URL)
+conn.autocommit = True
 cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
+    user_id BIGINT PRIMARY KEY,
     last_checkin TEXT,
     streak INTEGER DEFAULT 0
 )
 """)
-conn.commit()
 
 # ==============================
 # 命令
@@ -109,7 +114,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     today_date = str(datetime.date.today())
 
-    cursor.execute("SELECT last_checkin, streak FROM users WHERE user_id=?", (user_id,))
+    cursor.execute("SELECT last_checkin, streak FROM users WHERE user_id=%s", (user_id,))
     row = cursor.fetchone()
 
     if row:
@@ -119,17 +124,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             streak = 1
         cursor.execute(
-            "UPDATE users SET last_checkin=?, streak=? WHERE user_id=?",
+            "UPDATE users SET last_checkin=%s, streak=%s WHERE user_id=%s",
             (today_date, streak, user_id),
         )
     else:
         streak = 1
         cursor.execute(
-            "INSERT INTO users VALUES (?, ?, ?)",
+            "INSERT INTO users VALUES (%s, %s, %s)",
             (user_id, today_date, streak),
         )
-
-    conn.commit()
 
     await update.message.reply_text(feedback)
     await update.message.reply_text(f"🔥 连续打卡：{streak}天")
