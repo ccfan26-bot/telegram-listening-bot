@@ -4,3 +4,4 @@ apscheduler
 psycopg2-binary
 pytz
 gtts
+yt-dlp
