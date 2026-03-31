@@ -23,16 +23,27 @@ import openai
 # ==============================
 # 环境变量
 # ==============================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-POE_API_KEY = os.getenv("POE_API_KEY")
+BOT_TOKEN           = os.getenv("BOT_TOKEN")
+POE_API_KEY         = os.getenv("POE_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DATABASE_URL        = os.getenv("DATABASE_URL")
+ADMIN_ID            = int(os.getenv("ADMIN_ID", "0"))
+YOUTUBE_COOKIES     = os.getenv("YOUTUBE_COOKIES")   # cookies.txt 完整文本内容
 
 if not BOT_TOKEN or not POE_API_KEY:
     raise ValueError("Missing BOT_TOKEN or POE_API_KEY")
 if not DATABASE_URL:
     raise ValueError("Missing DATABASE_URL")
+
+# ── 若设置了 YOUTUBE_COOKIES，启动时写入临时文件 ──
+_COOKIES_FILE = "/tmp/yt_cookies.txt"
+if YOUTUBE_COOKIES:
+    with open(_COOKIES_FILE, "w", encoding="utf-8") as _cf:
+        _cf.write(YOUTUBE_COOKIES)
+    print("✅ YouTube cookies 已写入 /tmp/yt_cookies.txt")
+else:
+    _COOKIES_FILE = None
+    print("⚠️  未配置 YOUTUBE_COOKIES，yt-dlp 将以匿名方式访问 YouTube")
 
 # ==============================
 # Poe 客户端
@@ -182,8 +193,8 @@ seed_materials()
 # 常量 & 状态
 # ==============================
 DIFFICULTY_LABELS = {1: "🟢 初级", 2: "🟡 中级", 3: "🔴 高级"}
-MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10 MB
-pending_add = {}  # user_id -> {"step": "waiting_input" | "confirming", "data": {...}}
+MAX_AUDIO_BYTES   = 10 * 1024 * 1024   # 10 MB
+pending_add: dict = {}                  # user_id -> {"step": ..., "data": {...}}
 
 # ==============================
 # 数据库辅助函数
@@ -304,10 +315,10 @@ def fetch_audio_from_url(audio_url: str, headers: dict) -> tuple[bytes, str]:
     elif "mp3" in content_type or "mpeg" in content_type:
         ext = "mp3"
     else:
-        ext = "webm"  # YouTube 默认
+        ext = "webm"   # YouTube 默认
 
     chunks = []
-    total = 0
+    total  = 0
     for chunk in resp.iter_content(chunk_size=8192):
         chunks.append(chunk)
         total += len(chunk)
@@ -362,7 +373,7 @@ async def level_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
+    user_id    = query.from_user.id
     difficulty = int(query.data.split("_")[1])
 
     ensure_user(user_id)
@@ -425,10 +436,8 @@ async def material(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if audio_file_id:
-        # 有原声或已缓存的 TTS，直接发送
         await update.message.reply_audio(audio=audio_file_id, title=title)
     else:
-        # 纯文本材料：用 gTTS 生成并缓存 file_id
         thinking = await update.message.reply_text("🔊 正在生成音频，请稍候...")
         try:
             tts = gTTS(text=transcript, lang="en", slow=(diff == 1))
@@ -551,9 +560,9 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _show_add_confirmation(update: Update, user_id: int):
     """展示材料预览并请求确认"""
-    data = pending_add[user_id]["data"]
+    data       = pending_add[user_id]["data"]
     difficulty = data["difficulty"]
-    preview = data["transcript"][:200] + ("..." if len(data["transcript"]) > 200 else "")
+    preview    = data["transcript"][:200] + ("..." if len(data["transcript"]) > 200 else "")
     has_real_audio = data.get("audio_file_id") is not None
 
     audio_note = (
@@ -564,7 +573,7 @@ async def _show_add_confirmation(update: Update, user_id: int):
 
     keyboard = [[
         InlineKeyboardButton("✅ 确认添加", callback_data="add_confirm"),
-        InlineKeyboardButton("❌ 取消", callback_data="add_cancel"),
+        InlineKeyboardButton("❌ 取消",     callback_data="add_cancel"),
     ]]
 
     await update.message.reply_text(
@@ -580,6 +589,22 @@ async def _show_add_confirmation(update: Update, user_id: int):
     )
 
 
+def _build_ydl_opts() -> dict:
+    """
+    构建 yt-dlp 选项字典。
+    若已配置 YOUTUBE_COOKIES 环境变量，自动加入 cookiefile，
+    避免 YouTube 的「Sign in to confirm you're not a bot」错误。
+    """
+    opts = {
+        "format":      "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+        "quiet":       True,
+        "no_warnings": True,
+    }
+    if _COOKIES_FILE:
+        opts["cookiefile"] = _COOKIES_FILE
+    return opts
+
+
 async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理用户在 /add 流程中发送的文本或视频链接"""
     user_id = update.message.from_user.id
@@ -587,7 +612,7 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in pending_add or pending_add[user_id].get("step") != "waiting_input":
         return
 
-    text = update.message.text.strip()
+    text        = update.message.text.strip()
     url_pattern = re.compile(r'^https?://\S+$')
 
     # ---- 视频链接 ----
@@ -605,11 +630,7 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # ① 提取元数据 + 音频流直链，不下载任何文件
-            ydl_opts = {
-                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
-                "quiet": True,
-                "no_warnings": True,
-            }
+            ydl_opts = _build_ydl_opts()
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(text, download=False)
 
@@ -638,12 +659,12 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # ⑤ 上传原声音频到 Telegram，取得永久 file_id
             await thinking.edit_text("📤 正在上传原声音频，请稍候...")
-            audio_buf = io.BytesIO(audio_bytes)
+            audio_buf  = io.BytesIO(audio_bytes)
             sent_audio = await update.message.reply_audio(
-                audio=audio_buf,
-                title=analysis["title"],
-                filename=f"audio.{ext}",
-                caption="🎧 原声音频预览 — 请确认是否添加到材料库",
+                audio    = audio_buf,
+                title    = analysis["title"],
+                filename = f"audio.{ext}",
+                caption  = "🎧 原声音频预览 — 请确认是否添加到材料库",
             )
             file_id = sent_audio.audio.file_id if sent_audio.audio else None
 
@@ -661,10 +682,31 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _show_add_confirmation(update, user_id)
 
         except Exception as e:
-            await thinking.edit_text(
-                f"❌ 处理失败：{e}\n\n"
-                "请确认视频可公开访问，或换用直接粘贴英文文本的方式。"
-            )
+            err_str = str(e)
+
+            # ── 友好提示：YouTube 机器人验证错误 ──
+            if "Sign in to confirm" in err_str or "bot" in err_str.lower():
+                tip = (
+                    "❌ YouTube 拒绝访问：需要登录验证（反爬虫机制）。\n\n"
+                    "🔧 *解决方法：配置 YouTube Cookies*\n\n"
+                    "1️⃣ 在电脑浏览器中登录 YouTube\n"
+                    "2️⃣ 安装扩展 *Get cookies.txt LOCALLY*\n"
+                    "   （Chrome / Edge 应用商店搜索即可）\n"
+                    "3️⃣ 访问 youtube.com，点击扩展导出 `cookies.txt`\n"
+                    "4️⃣ 打开导出的文件，复制全部文本\n"
+                    "5️⃣ 在 Render 控制台 → Environment 添加：\n"
+                    "   `YOUTUBE_COOKIES` = *(粘贴 cookies.txt 全文)*\n"
+                    "6️⃣ 重新部署服务后即可正常使用\n\n"
+                    "📖 详细说明：https://github.com/yt-dlp/yt-dlp/wiki/FAQ"
+                    "#how-do-i-pass-cookies-to-yt-dlp"
+                )
+                await thinking.edit_text(tip, parse_mode="Markdown")
+            else:
+                await thinking.edit_text(
+                    f"❌ 处理失败：{err_str}\n\n"
+                    "请确认视频可公开访问，或换用直接粘贴英文文本的方式。"
+                )
+
             pending_add.pop(user_id, None)
 
     # ---- 英文文本 ----
@@ -710,12 +752,12 @@ async def handle_add_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thinking = await update.message.reply_text("🎵 正在处理音频文件，请稍候...")
     try:
-        file = await context.bot.get_file(audio.file_id)
+        file      = await context.bot.get_file(audio.file_id)
         file_path = "/tmp/upload_audio"
         await file.download_to_drive(file_path)
 
         mime = audio.mime_type or "audio/ogg"
-        fmt = mime.split("/")[-1]
+        fmt  = mime.split("/")[-1]
         if fmt == "mpeg":
             fmt = "mp3"
 
@@ -811,7 +853,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute(
         "SELECT current_material_id FROM users WHERE user_id=%s", (user_id,)
     )
-    row = cursor.fetchone()
+    row        = cursor.fetchone()
     transcript = ""
     if row and row[0]:
         mat = get_material(row[0])
@@ -819,7 +861,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             transcript = mat[2]
 
     voice = update.message.voice
-    file = await context.bot.get_file(voice.file_id)
+    file  = await context.bot.get_file(voice.file_id)
     await file.download_to_drive("/tmp/voice.ogg")
 
     with open("/tmp/voice.ogg", "rb") as f:
@@ -852,7 +894,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt_text},
+                {"type": "text",        "text": prompt_text},
                 {"type": "input_audio", "input_audio": {"data": audio_base64, "format": "ogg"}},
             ],
         }],
@@ -898,13 +940,13 @@ async def send_daily_reminders(bot):
     for user_id, title in cursor.fetchall():
         try:
             await bot.send_message(
-                chat_id=user_id,
-                text=(
+                chat_id    = user_id,
+                text       = (
                     f"⏰ *每日练习提醒*\n\n"
                     f"📖 当前材料：{title}\n\n"
                     f"今天练了吗？发 /material 开始 💪"
                 ),
-                parse_mode="Markdown",
+                parse_mode = "Markdown",
             )
         except Exception as e:
             print(f"Reminder failed for {user_id}: {e}")
@@ -914,10 +956,10 @@ async def post_init(application):
     scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Shanghai"))
     scheduler.add_job(
         send_daily_reminders,
-        trigger="cron",
-        hour=9,
-        minute=0,
-        args=[application.bot],
+        trigger = "cron",
+        hour    = 9,
+        minute  = 0,
+        args    = [application.bot],
     )
     scheduler.start()
     print("Scheduler started — daily reminders at 09:00 CST")
@@ -933,19 +975,19 @@ app = (
     .build()
 )
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("setlevel", setlevel))
-app.add_handler(CommandHandler("material", material))
-app.add_handler(CommandHandler("done", done))
-app.add_handler(CommandHandler("status", status))
-app.add_handler(CommandHandler("add", add_command))
-app.add_handler(CommandHandler("cancel", cancel_command))
-app.add_handler(CommandHandler("listmaterials", listmaterials))
-app.add_handler(CallbackQueryHandler(level_callback, pattern="^level_"))
+app.add_handler(CommandHandler("start",          start))
+app.add_handler(CommandHandler("setlevel",       setlevel))
+app.add_handler(CommandHandler("material",       material))
+app.add_handler(CommandHandler("done",           done))
+app.add_handler(CommandHandler("status",         status))
+app.add_handler(CommandHandler("add",            add_command))
+app.add_handler(CommandHandler("cancel",         cancel_command))
+app.add_handler(CommandHandler("listmaterials",  listmaterials))
+app.add_handler(CallbackQueryHandler(level_callback,       pattern="^level_"))
 app.add_handler(CallbackQueryHandler(add_confirm_callback, pattern="^add_"))
-app.add_handler(MessageHandler(filters.AUDIO, handle_add_audio))
-app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_text))
+app.add_handler(MessageHandler(filters.AUDIO,                           handle_add_audio))
+app.add_handler(MessageHandler(filters.VOICE,                           handle_voice))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,         handle_add_text))
 
 # ==============================
 # Webhook 启动
@@ -961,8 +1003,8 @@ if __name__ == "__main__":
     print("Webhook URL:", webhook_url)
 
     app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=webhook_url,
-        url_path=BOT_TOKEN,
+        listen      = "0.0.0.0",
+        port        = PORT,
+        webhook_url = webhook_url,
+        url_path    = BOT_TOKEN,
     )
