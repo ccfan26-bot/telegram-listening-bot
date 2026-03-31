@@ -6,6 +6,7 @@ import json
 import re
 import psycopg2
 import pytz
+import requests as http_requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from gtts import gTTS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -181,6 +182,7 @@ seed_materials()
 # 常量 & 状态
 # ==============================
 DIFFICULTY_LABELS = {1: "🟢 初级", 2: "🟡 中级", 3: "🔴 高级"}
+MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10 MB
 pending_add = {}  # user_id -> {"step": "waiting_input" | "confirming", "data": {...}}
 
 # ==============================
@@ -223,7 +225,7 @@ def is_admin(user_id):
 # ==============================
 # AI 辅助函数
 # ==============================
-async def ai_analyze_material(text):
+async def ai_analyze_material(text: str) -> dict:
     """调用 AI 自动判断标题和难度，返回 dict"""
     response = client.chat.completions.create(
         model="gpt-4o",
@@ -246,16 +248,12 @@ async def ai_analyze_material(text):
     return json.loads(content)
 
 
-async def transcribe_audio(file_path, fmt="ogg"):
-    """使用 GPT-4o 转写音频文件，返回文本"""
-    with open(file_path, "rb") as f:
-        audio_data = f.read()
+async def transcribe_audio_bytes(audio_bytes: bytes, fmt: str = "webm") -> str:
+    """使用 GPT-4o 转写音频字节数据，返回文本"""
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise ValueError("音频过大（超过 10 MB），请上传较短的片段")
 
-    if len(audio_data) > 10 * 1024 * 1024:
-        raise ValueError("音频文件过大（超过 10MB），请上传较短的音频片段")
-
-    audio_base64 = base64.b64encode(audio_data).decode("utf-8")
-
+    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{
@@ -276,6 +274,47 @@ async def transcribe_audio(file_path, fmt="ogg"):
     if not transcript:
         raise ValueError("未能转写出任何文字，请检查音频内容是否为英文语音")
     return transcript
+
+
+async def transcribe_audio(file_path: str, fmt: str = "ogg") -> str:
+    """读取本地音频文件后调用 transcribe_audio_bytes"""
+    with open(file_path, "rb") as f:
+        audio_bytes = f.read()
+    return await transcribe_audio_bytes(audio_bytes, fmt)
+
+
+def fetch_audio_from_url(audio_url: str, headers: dict) -> tuple[bytes, str]:
+    """
+    用 yt-dlp 提取的直链 + headers，流式拉取音频到内存。
+    返回 (audio_bytes, ext)，超过 10 MB 则抛出异常。
+    """
+    resp = http_requests.get(
+        audio_url,
+        headers=headers,
+        timeout=60,
+        stream=True,
+    )
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("Content-Type", "")
+    if "mp4" in content_type or "m4a" in content_type:
+        ext = "m4a"
+    elif "ogg" in content_type or "opus" in content_type:
+        ext = "ogg"
+    elif "mp3" in content_type or "mpeg" in content_type:
+        ext = "mp3"
+    else:
+        ext = "webm"  # YouTube 默认
+
+    chunks = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=8192):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > MAX_AUDIO_BYTES:
+            raise ValueError("音频流超过 10 MB 限制，请提供较短的视频（建议 5 分钟以内）")
+
+    return b"".join(chunks), ext
 
 
 # ==============================
@@ -386,8 +425,10 @@ async def material(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if audio_file_id:
+        # 有原声或已缓存的 TTS，直接发送
         await update.message.reply_audio(audio=audio_file_id, title=title)
     else:
+        # 纯文本材料：用 gTTS 生成并缓存 file_id
         thinking = await update.message.reply_text("🔊 正在生成音频，请稍候...")
         try:
             tts = gTTS(text=transcript, lang="en", slow=(diff == 1))
@@ -513,6 +554,13 @@ async def _show_add_confirmation(update: Update, user_id: int):
     data = pending_add[user_id]["data"]
     difficulty = data["difficulty"]
     preview = data["transcript"][:200] + ("..." if len(data["transcript"]) > 200 else "")
+    has_real_audio = data.get("audio_file_id") is not None
+
+    audio_note = (
+        "🎙 原声音频已上传（见上方消息）"
+        if has_real_audio
+        else "🔊 播放时将自动生成 TTS 合成音频"
+    )
 
     keyboard = [[
         InlineKeyboardButton("✅ 确认添加", callback_data="add_confirm"),
@@ -523,7 +571,8 @@ async def _show_add_confirmation(update: Update, user_id: int):
         f"📋 *材料预览*\n\n"
         f"📖 *标题：* {data['title']}\n"
         f"📊 *难度：* {DIFFICULTY_LABELS.get(difficulty, str(difficulty))}\n"
-        f"💡 *AI 判断：* {data['reason']}\n\n"
+        f"💡 *AI 判断：* {data['reason']}\n"
+        f"🔈 *音频：* {audio_note}\n\n"
         f"📝 *原文预览：*\n{preview}\n\n"
         f"确认添加到材料库吗？",
         parse_mode="Markdown",
@@ -536,14 +585,14 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
     if user_id not in pending_add or pending_add[user_id].get("step") != "waiting_input":
-        return  # 不在添加流程中，忽略
+        return
 
     text = update.message.text.strip()
     url_pattern = re.compile(r'^https?://\S+$')
 
     # ---- 视频链接 ----
     if url_pattern.match(text):
-        thinking = await update.message.reply_text("🔗 正在下载视频音频，请稍候...")
+        thinking = await update.message.reply_text("🔗 正在解析视频链接，请稍候...")
         try:
             try:
                 import yt_dlp
@@ -555,35 +604,57 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending_add.pop(user_id, None)
                 return
 
+            # ① 提取元数据 + 音频流直链，不下载任何文件
             ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-                'outtmpl': '/tmp/yt_audio.%(ext)s',
-                'quiet': True,
-                'no_warnings': True,
-                'max_filesize': 10 * 1024 * 1024,
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+                "quiet": True,
+                "no_warnings": True,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(text, download=True)
-                ext = info.get('ext', 'webm')
-                video_title = info.get('title', '')
+                info = ydl.extract_info(text, download=False)
 
+            video_title  = info.get("title", "")
+            audio_url    = info.get("url", "")
+            http_headers = info.get("http_headers", {})
+
+            if not audio_url:
+                raise ValueError("无法从该链接提取音频流，请换一个视频试试")
+
+            # ② 流式拉取音频到内存（不落磁盘）
+            await thinking.edit_text("⬇️ 正在获取音频流，请稍候...")
+            audio_bytes, ext = fetch_audio_from_url(audio_url, http_headers)
+
+            # ③ 转写
             await thinking.edit_text("🎙 正在转写音频内容，请稍候...")
-            transcript = await transcribe_audio(f'/tmp/yt_audio.{ext}', ext)
+            transcript = await transcribe_audio_bytes(audio_bytes, ext)
 
+            # ④ AI 分析难度
             await thinking.edit_text("🤖 正在分析难度，请稍候...")
             analysis = await ai_analyze_material(transcript)
 
-            if video_title and len(analysis.get('title', '')) < 3:
-                analysis['title'] = video_title
+            # 视频标题兜底
+            if video_title and len(analysis.get("title", "")) < 3:
+                analysis["title"] = video_title
+
+            # ⑤ 上传原声音频到 Telegram，取得永久 file_id
+            await thinking.edit_text("📤 正在上传原声音频，请稍候...")
+            audio_buf = io.BytesIO(audio_bytes)
+            sent_audio = await update.message.reply_audio(
+                audio=audio_buf,
+                title=analysis["title"],
+                filename=f"audio.{ext}",
+                caption="🎧 原声音频预览 — 请确认是否添加到材料库",
+            )
+            file_id = sent_audio.audio.file_id if sent_audio.audio else None
 
             pending_add[user_id] = {
                 "step": "confirming",
                 "data": {
-                    "title": analysis['title'],
-                    "difficulty": analysis['difficulty'],
-                    "transcript": transcript,
-                    "reason": analysis['reason'],
-                    "audio_file_id": None,
+                    "title":         analysis["title"],
+                    "difficulty":    analysis["difficulty"],
+                    "transcript":    transcript,
+                    "reason":        analysis["reason"],
+                    "audio_file_id": file_id,   # 原声，永久有效
                 },
             }
             await thinking.delete()
@@ -611,11 +682,11 @@ async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_add[user_id] = {
                 "step": "confirming",
                 "data": {
-                    "title": analysis['title'],
-                    "difficulty": analysis['difficulty'],
-                    "transcript": text,
-                    "reason": analysis['reason'],
-                    "audio_file_id": None,
+                    "title":         analysis["title"],
+                    "difficulty":    analysis["difficulty"],
+                    "transcript":    text,
+                    "reason":        analysis["reason"],
+                    "audio_file_id": None,   # 无原声，播放时 gTTS 生成
                 },
             }
             await thinking.delete()
@@ -657,11 +728,11 @@ async def handle_add_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_add[user_id] = {
             "step": "confirming",
             "data": {
-                "title": analysis['title'],
-                "difficulty": analysis['difficulty'],
-                "transcript": transcript,
-                "reason": analysis['reason'],
-                "audio_file_id": audio.file_id,  # 直接缓存上传的音频，无需 gTTS
+                "title":         analysis["title"],
+                "difficulty":    analysis["difficulty"],
+                "transcript":    transcript,
+                "reason":        analysis["reason"],
+                "audio_file_id": audio.file_id,   # 原声，永久有效
             },
         }
         await thinking.delete()
@@ -692,7 +763,7 @@ async def add_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     cursor.execute(
         "INSERT INTO materials (title, transcript, audio_file_id, difficulty) "
         "VALUES (%s, %s, %s, %s) RETURNING id",
-        (data['title'], data['transcript'], data.get('audio_file_id'), data['difficulty']),
+        (data["title"], data["transcript"], data.get("audio_file_id"), data["difficulty"]),
     )
     new_id = cursor.fetchone()[0]
     pending_add.pop(user_id, None)
@@ -789,7 +860,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     feedback = chat.choices[0].message.content
 
     today_date = str(datetime.date.today())
-    yesterday = str(datetime.date.today() - datetime.timedelta(days=1))
+    yesterday  = str(datetime.date.today() - datetime.timedelta(days=1))
 
     cursor.execute(
         "SELECT last_checkin, streak FROM users WHERE user_id=%s", (user_id,)
