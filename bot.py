@@ -33,7 +33,7 @@ client = openai.OpenAI(
 # ==============================
 # 数据库
 # ==============================
-conn = sqlite3.connect("users.db", check_same_thread=False)
+conn = sqlite3.connect("/tmp/users.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -67,9 +67,9 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
-    await file.download_to_drive("voice.ogg")
+    await file.download_to_drive("/tmp/voice.ogg")
 
-    with open("voice.ogg", "rb") as f:
+    with open("/tmp/voice.ogg", "rb") as f:
         audio_base64 = base64.b64encode(f.read()).decode("utf-8")
 
     prompt_text = """
