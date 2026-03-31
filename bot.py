@@ -596,7 +596,7 @@ def _build_ydl_opts() -> dict:
     避免 YouTube 的「Sign in to confirm you're not a bot」错误。
     """
     opts = {
-        "format":      "bestaudio/best",
+        "format":      "bestaudio/bestvideo/best",
         "quiet":       True,
         "no_warnings": True,
     }
