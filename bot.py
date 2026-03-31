@@ -40,7 +40,7 @@ client = openai.OpenAI(
 )
 
 # ==============================
-# 数据库初始化
+# 数据库初始化 + 迁移
 # ==============================
 conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS users (
     reminder_enabled BOOLEAN DEFAULT TRUE
 )
 """)
+
+# 兼容旧表：如果列不存在就自动添加
+migrations = [
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS difficulty INTEGER DEFAULT 1",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_material_id INTEGER",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS reminder_enabled BOOLEAN DEFAULT TRUE",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_checkin TEXT",
+]
+for sql in migrations:
+    cursor.execute(sql)
 
 # ==============================
 # 预置材料（9 篇，初/中/高各 3 篇）
