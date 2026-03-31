@@ -2,6 +2,8 @@ import os
 import base64
 import datetime
 import io
+import json
+import re
 import psycopg2
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -68,7 +70,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-# 兼容旧表：如果列不存在就自动添加
 migrations = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS difficulty INTEGER DEFAULT 1",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_material_id INTEGER",
@@ -83,7 +84,6 @@ for sql in migrations:
 # 预置材料（9 篇，初/中/高各 3 篇）
 # ==============================
 SEED_MATERIALS = [
-    # 🟢 初级
     (
         "My Morning Routine",
         "I wake up at seven o'clock every morning. First, I brush my teeth and wash my face. "
@@ -105,7 +105,6 @@ SEED_MATERIALS = [
         "Days like this are great for walking in the park. I hope it stays like this all week.",
         1,
     ),
-    # 🟡 中级
     (
         "The Benefits of Exercise",
         "Regular exercise has many benefits for both your body and mind. "
@@ -132,7 +131,6 @@ SEED_MATERIALS = [
         "With the right approach, you can explore the world without breaking the bank.",
         2,
     ),
-    # 🔴 高级
     (
         "The Future of Artificial Intelligence",
         "Artificial intelligence is rapidly reshaping the landscape of nearly every industry, "
@@ -183,7 +181,7 @@ seed_materials()
 # 常量 & 状态
 # ==============================
 DIFFICULTY_LABELS = {1: "🟢 初级", 2: "🟡 中级", 3: "🔴 高级"}
-pending_material = {}  # 管理员添加素材时的临时状态
+pending_add = {}  # user_id -> {"step": "waiting_input" | "confirming", "data": {...}}
 
 # ==============================
 # 数据库辅助函数
@@ -223,6 +221,64 @@ def is_admin(user_id):
 
 
 # ==============================
+# AI 辅助函数
+# ==============================
+async def ai_analyze_material(text):
+    """调用 AI 自动判断标题和难度，返回 dict"""
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": (
+                "分析以下英文文本，给出合适的标题和难度等级。\n\n"
+                f"文本：\n{text[:2000]}\n\n"
+                "只输出纯 JSON，格式如下（不加任何 markdown 标记或代码块）：\n"
+                '{"title": "英文标题", "difficulty": 2, "reason": "难度判断依据（中文一句话）"}\n\n'
+                "难度标准：\n"
+                "1=初级：日常生活话题，简单词汇和句型\n"
+                "2=中级：较丰富词汇，复合句，适合有一定基础者\n"
+                "3=高级：专业词汇，复杂论述，学术或时事议题"
+            ),
+        }],
+    )
+    content = response.choices[0].message.content.strip()
+    content = re.sub(r'```(?:json)?\s*|\s*```', '', content).strip()
+    return json.loads(content)
+
+
+async def transcribe_audio(file_path, fmt="ogg"):
+    """使用 GPT-4o 转写音频文件，返回文本"""
+    with open(file_path, "rb") as f:
+        audio_data = f.read()
+
+    if len(audio_data) > 10 * 1024 * 1024:
+        raise ValueError("音频文件过大（超过 10MB），请上传较短的音频片段")
+
+    audio_base64 = base64.b64encode(audio_data).decode("utf-8")
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "请准确转写这段英文音频的全部内容，只输出原文文字，不要任何解释。",
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": audio_base64, "format": fmt},
+                },
+            ],
+        }],
+    )
+    transcript = response.choices[0].message.content.strip()
+    if not transcript:
+        raise ValueError("未能转写出任何文字，请检查音频内容是否为英文语音")
+    return transcript
+
+
+# ==============================
 # /start
 # ==============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,7 +297,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "▸ 反复听同一段材料，先不看原文\n"
         "▸ 模仿语音语调跟读\n"
         "▸ 能流利复述后再进入下一篇\n\n"
-        "初/中/高级各有 3 篇精选材料，音频自动生成。\n\n"
+        "初/中/高级各有若干精选材料，音频自动生成。\n\n"
         "请先选择你的难度等级：",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -330,10 +386,8 @@ async def material(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if audio_file_id:
-        # 直接使用缓存的 file_id
         await update.message.reply_audio(audio=audio_file_id, title=title)
     else:
-        # 用 gTTS 生成（初级稍慢）
         thinking = await update.message.reply_text("🔊 正在生成音频，请稍候...")
         try:
             tts = gTTS(text=transcript, lang="en", slow=(diff == 1))
@@ -345,7 +399,6 @@ async def material(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 audio=buf, title=title, filename=f"{title}.mp3"
             )
 
-            # 缓存 file_id，下次直接复用
             if sent.audio:
                 cursor.execute(
                     "UPDATE materials SET audio_file_id=%s WHERE id=%s",
@@ -393,8 +446,8 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE users SET current_material_id=NULL WHERE user_id=%s", (user_id,)
         )
         await update.message.reply_text(
-            "🏆 你已完成该难度全部 3 篇材料！\n"
-            "用 /setlevel 挑战更高难度 🚀"
+            "🏆 你已完成该难度全部材料！\n"
+            "用 /setlevel 挑战更高难度，或 /add 添加新材料 🚀"
         )
 
 
@@ -427,65 +480,230 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==============================
-# /addmaterial（管理员追加自定义材料）
+# /add — 添加材料（文本 / 音频文件 / 视频链接）
 # ==============================
-async def addmaterial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ 只有管理员可以添加材料。")
-        return
+    ensure_user(user_id)
+    pending_add[user_id] = {"step": "waiting_input"}
 
-    pending_material[user_id] = True
     await update.message.reply_text(
-        "📤 请发送音频文件\n\n"
-        "在文件的 *caption* 中按以下格式填写：\n"
-        "`标题|难度|原文`\n\n"
-        "难度：1=初级，2=中级，3=高级\n\n"
-        "示例：\n"
-        "`BBC News Intro|2|The Prime Minister announced today that...`",
+        "📥 *添加新材料*\n\n"
+        "请发送以下任意一种内容：\n\n"
+        "📝 *英文文本* — 直接粘贴英文原文\n"
+        "🎵 *音频文件* — 上传 mp3 / m4a / wav 等格式\n"
+        "🔗 *视频链接* — YouTube 等平台的视频链接\n\n"
+        "AI 会自动识别标题和难度，无需手动填写。\n\n"
+        "发 /cancel 取消",
         parse_mode="Markdown",
     )
 
 
-async def handle_audio_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if not is_admin(user_id) or user_id not in pending_material:
+    if user_id in pending_add:
+        pending_add.pop(user_id)
+        await update.message.reply_text("❌ 已取消。")
+    else:
+        await update.message.reply_text("没有进行中的操作。")
+
+
+async def _show_add_confirmation(update: Update, user_id: int):
+    """展示材料预览并请求确认"""
+    data = pending_add[user_id]["data"]
+    difficulty = data["difficulty"]
+    preview = data["transcript"][:200] + ("..." if len(data["transcript"]) > 200 else "")
+
+    keyboard = [[
+        InlineKeyboardButton("✅ 确认添加", callback_data="add_confirm"),
+        InlineKeyboardButton("❌ 取消", callback_data="add_cancel"),
+    ]]
+
+    await update.message.reply_text(
+        f"📋 *材料预览*\n\n"
+        f"📖 *标题：* {data['title']}\n"
+        f"📊 *难度：* {DIFFICULTY_LABELS.get(difficulty, str(difficulty))}\n"
+        f"💡 *AI 判断：* {data['reason']}\n\n"
+        f"📝 *原文预览：*\n{preview}\n\n"
+        f"确认添加到材料库吗？",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理用户在 /add 流程中发送的文本或视频链接"""
+    user_id = update.message.from_user.id
+
+    if user_id not in pending_add or pending_add[user_id].get("step") != "waiting_input":
+        return  # 不在添加流程中，忽略
+
+    text = update.message.text.strip()
+    url_pattern = re.compile(r'^https?://\S+$')
+
+    # ---- 视频链接 ----
+    if url_pattern.match(text):
+        thinking = await update.message.reply_text("🔗 正在下载视频音频，请稍候...")
+        try:
+            try:
+                import yt_dlp
+            except ImportError:
+                await thinking.edit_text(
+                    "❌ yt-dlp 未安装，无法处理视频链接。\n"
+                    "请直接粘贴英文文本或上传音频文件。"
+                )
+                pending_add.pop(user_id, None)
+                return
+
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+                'outtmpl': '/tmp/yt_audio.%(ext)s',
+                'quiet': True,
+                'no_warnings': True,
+                'max_filesize': 10 * 1024 * 1024,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(text, download=True)
+                ext = info.get('ext', 'webm')
+                video_title = info.get('title', '')
+
+            await thinking.edit_text("🎙 正在转写音频内容，请稍候...")
+            transcript = await transcribe_audio(f'/tmp/yt_audio.{ext}', ext)
+
+            await thinking.edit_text("🤖 正在分析难度，请稍候...")
+            analysis = await ai_analyze_material(transcript)
+
+            if video_title and len(analysis.get('title', '')) < 3:
+                analysis['title'] = video_title
+
+            pending_add[user_id] = {
+                "step": "confirming",
+                "data": {
+                    "title": analysis['title'],
+                    "difficulty": analysis['difficulty'],
+                    "transcript": transcript,
+                    "reason": analysis['reason'],
+                    "audio_file_id": None,
+                },
+            }
+            await thinking.delete()
+            await _show_add_confirmation(update, user_id)
+
+        except Exception as e:
+            await thinking.edit_text(
+                f"❌ 处理失败：{e}\n\n"
+                "请确认视频可公开访问，或换用直接粘贴英文文本的方式。"
+            )
+            pending_add.pop(user_id, None)
+
+    # ---- 英文文本 ----
+    else:
+        if len(text) < 30:
+            await update.message.reply_text(
+                "⚠️ 文本太短，请发送完整的英文材料（至少 30 个字符）。"
+            )
+            return
+
+        thinking = await update.message.reply_text("🤖 正在分析材料难度，请稍候...")
+        try:
+            analysis = await ai_analyze_material(text)
+
+            pending_add[user_id] = {
+                "step": "confirming",
+                "data": {
+                    "title": analysis['title'],
+                    "difficulty": analysis['difficulty'],
+                    "transcript": text,
+                    "reason": analysis['reason'],
+                    "audio_file_id": None,
+                },
+            }
+            await thinking.delete()
+            await _show_add_confirmation(update, user_id)
+
+        except Exception as e:
+            await thinking.edit_text(f"❌ 分析失败：{e}")
+            pending_add.pop(user_id, None)
+
+
+async def handle_add_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理用户在 /add 流程中上传的音频文件"""
+    user_id = update.message.from_user.id
+
+    if user_id not in pending_add or pending_add[user_id].get("step") != "waiting_input":
         return
 
     audio = update.message.audio
     if not audio:
         return
 
-    caption = update.message.caption or ""
-    parts = caption.split("|", 2)
-
-    if len(parts) < 3:
-        await update.message.reply_text(
-            "❌ Caption 格式错误，请按：`标题|难度|原文`", parse_mode="Markdown"
-        )
-        return
-
-    title = parts[0].strip()
+    thinking = await update.message.reply_text("🎵 正在处理音频文件，请稍候...")
     try:
-        difficulty = int(parts[1].strip())
-        assert difficulty in [1, 2, 3]
-    except (ValueError, AssertionError):
-        await update.message.reply_text("❌ 难度必须是 1、2 或 3")
+        file = await context.bot.get_file(audio.file_id)
+        file_path = "/tmp/upload_audio"
+        await file.download_to_drive(file_path)
+
+        mime = audio.mime_type or "audio/ogg"
+        fmt = mime.split("/")[-1]
+        if fmt == "mpeg":
+            fmt = "mp3"
+
+        await thinking.edit_text("🎙 正在转写音频内容，请稍候...")
+        transcript = await transcribe_audio(file_path, fmt)
+
+        await thinking.edit_text("🤖 正在分析难度，请稍候...")
+        analysis = await ai_analyze_material(transcript)
+
+        pending_add[user_id] = {
+            "step": "confirming",
+            "data": {
+                "title": analysis['title'],
+                "difficulty": analysis['difficulty'],
+                "transcript": transcript,
+                "reason": analysis['reason'],
+                "audio_file_id": audio.file_id,  # 直接缓存上传的音频，无需 gTTS
+            },
+        }
+        await thinking.delete()
+        await _show_add_confirmation(update, user_id)
+
+    except Exception as e:
+        await thinking.edit_text(f"❌ 处理失败：{e}")
+        pending_add.pop(user_id, None)
+
+
+async def add_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理添加材料的确认 / 取消按钮"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if query.data == "add_cancel":
+        pending_add.pop(user_id, None)
+        await query.edit_message_text("❌ 已取消添加。")
         return
 
-    transcript = parts[2].strip()
+    state = pending_add.get(user_id)
+    if not state or state.get("step") != "confirming":
+        await query.edit_message_text("⚠️ 操作已过期，请重新发送 /add。")
+        return
+
+    data = state["data"]
     cursor.execute(
-        "INSERT INTO materials (title, transcript, audio_file_id, difficulty) VALUES (%s, %s, %s, %s) RETURNING id",
-        (title, transcript, audio.file_id, difficulty),
+        "INSERT INTO materials (title, transcript, audio_file_id, difficulty) "
+        "VALUES (%s, %s, %s, %s) RETURNING id",
+        (data['title'], data['transcript'], data.get('audio_file_id'), data['difficulty']),
     )
     new_id = cursor.fetchone()[0]
-    pending_material.pop(user_id, None)
+    pending_add.pop(user_id, None)
 
-    await update.message.reply_text(
-        f"✅ 材料添加成功！\n\n"
+    await query.edit_message_text(
+        f"✅ *材料已成功添加！*\n\n"
         f"🆔 ID：{new_id}\n"
-        f"📖 标题：{title}\n"
-        f"📊 难度：{DIFFICULTY_LABELS[difficulty]}"
+        f"📖 标题：{data['title']}\n"
+        f"📊 难度：{DIFFICULTY_LABELS.get(data['difficulty'], str(data['difficulty']))}\n\n"
+        f"其他用户选择对应难度时将会学习到此材料 🎉",
+        parse_mode="Markdown",
     )
 
 
@@ -570,7 +788,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     feedback = chat.choices[0].message.content
 
-    # 打卡更新
     today_date = str(datetime.date.today())
     yesterday = str(datetime.date.today() - datetime.timedelta(days=1))
 
@@ -650,11 +867,14 @@ app.add_handler(CommandHandler("setlevel", setlevel))
 app.add_handler(CommandHandler("material", material))
 app.add_handler(CommandHandler("done", done))
 app.add_handler(CommandHandler("status", status))
-app.add_handler(CommandHandler("addmaterial", addmaterial))
+app.add_handler(CommandHandler("add", add_command))
+app.add_handler(CommandHandler("cancel", cancel_command))
 app.add_handler(CommandHandler("listmaterials", listmaterials))
 app.add_handler(CallbackQueryHandler(level_callback, pattern="^level_"))
-app.add_handler(MessageHandler(filters.AUDIO, handle_audio_upload))
+app.add_handler(CallbackQueryHandler(add_confirm_callback, pattern="^add_"))
+app.add_handler(MessageHandler(filters.AUDIO, handle_add_audio))
 app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_text))
 
 # ==============================
 # Webhook 启动
